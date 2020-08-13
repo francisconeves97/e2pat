@@ -14,9 +14,10 @@ import pandas as pd
 from emerging_patterns import two_step_regression_handler
 import gui_utils
 from app import app
+import os
 
 
-DOWNLOADS_PATH = str(Path(__file__).parent) + '/data/'
+DOWNLOADS_PATH = str(os.path.abspath(os.path.dirname(__file__))) + '/data/'
 
 pagetitle = 'Emerging Patterns from CSV'
 prefix = 'padroes_rodovia_from_file'
