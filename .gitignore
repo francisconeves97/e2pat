@@ -129,9 +129,6 @@ dmypy.json
 # Static maps
 *temp_map.html
 
-# Data files
-data/
-
 .Rdata
 .Rhistory
 .Rproj.user
