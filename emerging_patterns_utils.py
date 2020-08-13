@@ -1,18 +1,25 @@
 from sklearn.linear_model import LinearRegression
 import numpy as np
 import plotly.graph_objects as go
-import dash_html_components as html
 from sklearn.metrics import r2_score
 from pathlib import Path
-from arff2pandas import a2p
-import subprocess
-import re
-import hashlib
 import pandas as pd
 from datetime import timedelta, datetime
 
 DOWNLOADS_PATH = str(Path(__file__).parent.parent.parent.parent) + '/data/temp'
 JAR_DIRECTORY = str(Path(__file__).parent)
+
+
+def concat_meteo_with_series(time_series, meteo_series, adjust_factor):
+    meteo_series_adjusted = meteo_series * adjust_factor
+    meteo_series_adjusted = meteo_series_adjusted[
+        meteo_series_adjusted.index.isin(time_series.dropna().index)]
+    return pd.concat([time_series, meteo_series_adjusted], axis=1)
+
+
+def get_waze_events(start_date, end_date, geojson, days):
+    # implementation needs access to the data sources
+    pass
 
 
 def replace_missing_values(series, attribute):

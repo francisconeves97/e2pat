@@ -5,22 +5,186 @@
 """
 
 import dash
+import numpy as np
+from dash.exceptions import PreventUpdate
+from folium import GeoJson, CircleMarker
 import dash_core_components as dcc
 import dash_html_components as html
-import dash_bootstrap_components as dbc
-from dash.dependencies import Input, Output
-from pathlib import Path
 import pandas as pd
-import numpy as np
+from dash.dependencies import Input, Output, State
+from pathlib import Path
 import json
 import dash_table
+import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
+import matplotlib.pyplot as plt
+from matplotlib import colors
 
-from emerging_patterns_utils import TwoStepRegression
-import gui_utils
+from app import app
+import plot_utils
 import map_utils
+import gui_utils
+from folium_draw import Draw
+import series_waze
+import series_espiras
+from emerging_patterns_utils import TwoStepRegression, get_waze_events, concat_meteo_with_series
 
-app = dash.Dash(__name__, assets_folder='assets', include_assets_files=True)
+DOWNLOADS_PATH = str(Path(__file__).parent) + '/data/'
+
+
+def convert_to_hex(rgba_color):
+    red = str(hex(int(rgba_color[0] * 255)))[2:].capitalize()
+    green = str(hex(int(rgba_color[1] * 255)))[2:].capitalize()
+    blue = str(hex(int(rgba_color[2] * 255)))[2:].capitalize()
+
+    if blue == '0':
+        blue = '00'
+    if red == '0':
+        red = '00'
+    if green == '0':
+        green = '00'
+
+    return '#' + red + green + blue
+
+
+def get_multidrop_options(label_format, lst):
+    return [{
+        'label': label_format.format(str(el).capitalize()), 'value': el
+    } for el in lst]
+
+
+def get_graph(fig, title=None):
+    children = []
+
+    if title is not None:
+        children.append(html.Div([html.H3(title, style={'marginBottom': 0})], style={'textAlign': "center"}))
+
+    children.append(dcc.Graph(figure=fig))
+
+    return html.Div(children)
+
+
+def get_map():
+    lisbon_map = map_utils.get_lisbon_map()
+    Draw(page_prefix='padroes_rodovia',
+         position='topleft',
+         draw_options={'polyline': True, 'marker': True, 'circlemarker': False, 'circle': False, 'polygon': True,
+                       'rectangle': False},
+         edit_options={'poly': {'allowIntersection': False}}).add_to(lisbon_map)
+    return lisbon_map
+
+
+def embed_map(folium_map, prefix):
+    return map_utils.embed_map(folium_map, prefix, height='370')
+
+
+pagetitle = 'Road Traffic Emerging Patterns'
+prefix = 'padroes_rodovia'
+
+meteo_options = [
+    'temperatura',
+    'humidade',
+    'intensidade_vento',
+    'prec_acumulada',
+    'pressao',
+    'radiacao'
+]
+parameters = [
+    ('date', ['2018-10-17', '2019-01-01'], gui_utils.Button.daterange),
+    ('calendario', list(gui_utils.calendar.keys()) + list(gui_utils.week_days.keys()), gui_utils.Button.multidrop),
+    ('granularidade_em_minutos', '60', gui_utils.Button.input),
+    ('start_hour', '00:00', gui_utils.Button.input),
+    ('end_hour', '23:59', gui_utils.Button.input),
+    ('dataset', ['waze', 'espiras', 'integrative'], gui_utils.Button.radio),
+    ('method', ['two_step_regression'], gui_utils.Button.radio),
+    ('attributes', ['all'], gui_utils.Button.multidrop),
+    ('geo_json', '', gui_utils.Button.input_hidden),
+    ('series_cache', '', gui_utils.Button.input_hidden),
+    ('meteo_series_cache', '', gui_utils.Button.input_hidden)
+]
+charts = [
+    ('speed_series', gui_utils.get_null_label(), gui_utils.Button.html, True),
+    ('time_point_series', gui_utils.get_null_label(), gui_utils.Button.html, True),
+    ('prediction', gui_utils.get_null_label(), gui_utils.Button.html, True)
+]
+
+layout = gui_utils.get_layout(pagetitle, [('parameters', 27, parameters),
+                                          ('selection_map', 27, [('lisbon_map', embed_map(get_map(), prefix),
+                                                                  gui_utils.Button.html)])], charts, prefix=prefix)
+
+
+def get_state_field(field: str, accessor: str = 'value', prefix: str = '', type=None):
+    states = dash.callback_context.states
+    value = states['{}{}.{}'.format(prefix, field, accessor)]
+    if type:
+        if type == dict:
+            try:
+                value = eval(value)
+            except:
+                return None
+        else:
+            value = type(value)
+    return value
+
+
+def draw_score_markers(data, folium_map, congestions_toggle):
+    cmap = plt.get_cmap('RdYlBu_r')
+
+    # Sort by score to get higher score markers on top of the map
+    data = sorted(data, key=lambda k: k['score'], reverse=congestions_toggle)
+    norm = colors.Normalize(vmin=-1, vmax=1)
+    placed_markers = set()
+    try:
+        for row in data:
+            color = convert_to_hex(cmap(norm(row['score'])))
+            tooltip = 'Location: {}<br />Attribute: {}<br />Time: {}<br />Score: {}'.format(
+                row['location'].replace('{', '').replace('`', '').replace('}', ''),
+                row['attribute_name'],
+                row['time_point'],
+                row['score'])
+            # Only place a marker per location
+            # TODO: change to max/min per location
+            if row['location'] in placed_markers:
+                continue
+
+            if row['dataset'] == 'espiras':
+                pmarker = CircleMarker(location=json.loads(row['location_coor']), radius=8, line_color=color,
+                                       color=color,
+                                       fill_color=color,
+                                       tooltip=tooltip)
+                pmarker.add_to(folium_map)
+            else:
+                if isinstance(row['location_coor'], dict):
+                    row['location_coor'] = str(row['location_coor'])
+                geojson = GeoJson(
+                    row['location_coor'].replace("\'", "\""),
+                    style_function=lambda f, color=color: {
+                        'fillColor': color,
+                        'color': color,
+                        'weight': 4,
+                        'fillOpacity': 0.7
+                    },
+                    tooltip=tooltip
+                )
+                geojson.add_to(folium_map)
+
+            placed_markers.add(row['location'])
+    except Exception as e:
+        print(e)
+
+
+def draw_jam_lines(jam_data, folium_map) -> None:
+    for i, row in jam_data.iterrows():
+        geojson = GeoJson(
+            row['path.street_coord'].replace('\'', '\"'),
+            style_function=lambda f: {
+                'fillColor': '#FF0000',
+                'color': '#FF0000',
+                'weight': 4,
+                'fillOpacity': 0.1,
+            }
+        )
+        geojson.add_to(folium_map)
 
 
 class NpEncoder(json.JSONEncoder):
@@ -33,16 +197,6 @@ class NpEncoder(json.JSONEncoder):
             return obj.tolist()
         else:
             return super(NpEncoder, self).default(obj)
-
-
-def embed_map(folium_map, prefix):
-    return map_utils.embed_map(folium_map, prefix, height='370')
-
-
-def get_multidrop_options(label_format, lst):
-    return [{
-        'label': label_format.format(str(el).capitalize()), 'value': el
-    } for el in lst]
 
 
 def two_step_regression_handler(time_series, granularity, locations, csv_file_path, initial_meteo_values=None,
@@ -215,91 +369,272 @@ def two_step_regression_handler(time_series, granularity, locations, csv_file_pa
     ])
 
 
-DOWNLOADS_PATH = str(Path(__file__).parent) + '/data/'
-
-pagetitle = 'Emerging Patterns from CSV'
-prefix = 'padroes_rodovia_from_file'
-
-meteo_options = [
-    'temperatura',
-    'humidade',
-    'intensidade_vento',
-    'prec_acumulada',
-    'pressao',
-    'radiacao'
-]
-parameters = [
-    ('nan', '10', gui_utils.Button.input_hidden),
-    ('csv_file_upload', '', gui_utils.Button.upload),
-    ('csv_file_path', '', gui_utils.Button.input_hidden),
-    ('granularidade_em_minutos', '60', gui_utils.Button.input)
-]
-charts = [
-    ('results_container', gui_utils.get_null_label(), gui_utils.Button.html, True)
-]
-
-layout = gui_utils.get_layout(pagetitle, [('parameters', 27, parameters)], charts, prefix=prefix)
+def get_series_plot(time_series, meteo_series, title):
+    figs = []
+    for attribute in time_series.columns:
+        series = concat_meteo_with_series(time_series[attribute], meteo_series,
+                                          time_series[attribute].max())
+        fig = plot_utils.get_series_plot(series, '{}'.format(attribute.capitalize()),
+                                         remove_gaps=True)
+        figs.append(get_graph(fig, '{} - {} Time Series with Meteorology'.format(title, attribute.capitalize())))
+    return figs
 
 
-def get_graph(fig, title=None):
-    children = []
+def get_dataset_time_series(dataset, start_date, end_date, days, granularity):
+    geojson = get_state_field('geo_json', prefix=prefix, type=dict)
+    geojson = geojson['geometry'] if geojson else None
 
-    if title is not None:
-        children.append(html.Div([html.H3(title, style={'marginBottom': 0})], style={'textAlign': "center"}))
+    all_series = []
+    time_series = None
+    locations = []
+    if not geojson:
+        return False, 'Selecione um ponto no mapa para obter eventos...'
 
-    children.append(dcc.Graph(figure=fig))
+    if dataset == 'waze' or dataset == 'integrative':
+        events_per_street, events_locations = get_waze_events(start_date, end_date, geojson, days)
+        events_locations = events_locations.rename(columns={'street_name': 'place_id'})
+        events_locations = events_locations.rename(columns={'path.street_coord': 'location'})
+        events_locations['dataset'] = 'waze'
+        if events_per_street is None or events_per_street.empty:
+            return False, 'Não foram encontrados eventos do waze com os filtros selecionados...'
 
-    return html.Div(children)
+        # Get time series
+        time_series, name = series_waze.get_event_series(events_per_street, granularity, geojson)
+        all_series.append(time_series)
+        locations.append(events_locations)
 
+    if dataset == 'espiras' or dataset == 'integrative':
+        time_series, events_locations = series_espiras.get_spatial_series_per_loop(start_date, end_date, granularity,
+                                                                                   days, geojson)
+        events_locations = events_locations.rename(columns={'espira': 'place_id'})
+        events_locations = events_locations.rename(columns={'coordinates': 'location'})
+        events_locations['dataset'] = 'espiras'
+        events_locations = events_locations.drop_duplicates('place_id')
 
-def get_state_field(field: str, accessor: str = 'value', prefix: str = '', type=None):
-    states = dash.callback_context.states
-    value = states['{}{}.{}'.format(prefix, field, accessor)]
-    if type:
-        if type == dict:
-            try:
-                value = eval(value)
-            except:
-                return None
+        locations.append(events_locations)
+        all_series.append(time_series)
+
+    if dataset != 'integrative':
+        return True, (time_series, locations[0])
+
+    # Integrative
+    if len(all_series) > 1:
+        time_series = pd.merge(all_series[0], all_series[1], left_index=True, right_index=True)
+        locations = pd.concat(locations)
+    else:
+        time_series = all_series[0]
+        locations = locations[0]
+    for attr in time_series.columns:
+        if attr.startswith('speed'):
+            time_series[attr] = time_series[attr].fillna(time_series[attr].max())
+        elif attr.startswith('spatial_extension') or attr.startswith('delay'):
+            time_series[attr] = time_series[attr].fillna(0)
         else:
-            value = type(value)
-    return value
+            # espiras
+            time_series[attr] = time_series[attr].fillna(0)
+
+    return True, (time_series, locations)
 
 
-@app.callback([Output(prefix + 'csv_file_upload_output', 'children'), Output(prefix + 'csv_file_path', 'value')],
-              [Input(prefix + 'csv_file_upload', 'filename')])
-def update_output(csv_file, *args):
-    if csv_file is None or len(csv_file) == 0:
-        return '', ''
-    return html.Span(children=csv_file), DOWNLOADS_PATH + csv_file
+operators = [['ge ', '>='],
+             ['le ', '<='],
+             ['lt ', '<'],
+             ['gt ', '>'],
+             ['ne ', '!='],
+             ['eq ', '='],
+             ['contains '],
+             ['datestartswith ']]
+
+
+def split_filter_part(filter_part):
+    for operator_type in operators:
+        for operator in operator_type:
+            if operator in filter_part:
+                name_part, value_part = filter_part.split(operator, 1)
+                name = name_part[name_part.find('{') + 1: name_part.rfind('}')]
+
+                value_part = value_part.strip()
+                v0 = value_part[0]
+                if (v0 == value_part[-1] and v0 in ("'", '"', '`')):
+                    value = value_part[1: -1].replace('\\' + v0, v0)
+                else:
+                    try:
+                        value = float(value_part)
+                    except ValueError:
+                        value = value_part
+
+                # word operators need spaces after them in the filter string,
+                # but we don't want these later
+                return name, operator_type[0].strip(), value
+
+    return [None] * 3
 
 
 @app.callback(
-    [Output(prefix + 'results_container', 'children')],
-    [Input(prefix + 'button', 'n_clicks')],
+    [Output('regressions_bigcontainer', 'children')],
+    [Input('regressions_meteo_button', 'n_clicks')],
+    [State(option, 'value') for option in meteo_options] +
+    [State('regressions_csv_file_path', 'value')])
+def filter_regressions_meteo(n_clicks, *kwargs):
+    if not dash.callback_context.triggered or dash.callback_context.triggered[0]['value'] is None:
+        raise PreventUpdate
+
+    csv_file = get_state_field('regressions_csv_file_path')
+    time_series_orig = pd.read_csv(csv_file, parse_dates=True, index_col=[0])
+    csv_file_name = csv_file.split('.')[0]
+    locations = pd.read_csv(csv_file_name + '-locations.csv', parse_dates=True, index_col=[0])
+
+    time_series_orig = time_series_orig.dropna()
+
+    # TODO: Get granularity
+    res = two_step_regression_handler(time_series_orig, 60, locations, csv_file)
+    return [html.Div(res, id="regressions_bigcontainer")]
+
+
+@app.callback(
+    [Output('patterns-datatable', "data"), Output('emerging-patterns-map', 'children')],
+    [Input('patterns-datatable', "filter_query"), Input('regressions_cache', 'value'),
+     Input('patterns-datatable', "page_current"),
+     Input('patterns-datatable', "page_size"),
+     Input('patterns-datatable', 'sort_by'),
+     Input('regressions_hour_range', 'value'), Input('emerging-patterns-congestions-toggle', 'value')])
+def update_table(filter, regressions, page_current, page_size, sort_by, hour_range, congestions_toggle, *kwargs):
+    regressions = json.loads(regressions)
+    dff = pd.DataFrame(regressions)
+    hours = pd.DataFrame(regressions).drop_duplicates('time_point')['time_point'].sort_values()
+    value_map = {}
+    for i, hour in enumerate(hours):
+        value_map[hour] = i
+
+    dff['time_point_values'] = dff['time_point'].map(value_map)
+    dff = dff[dff['time_point_values'].between(hour_range[0], hour_range[1])]
+
+    lisbon_map = map_utils.get_lisbon_map()
+
+    if filter is None and sort_by is None:
+        draw_score_markers(dff.to_dict('records'), lisbon_map, congestions_toggle)
+        map_iframe = embed_map(lisbon_map, prefix='emerging_patterns')
+        return [dff.iloc[page_current * page_size:(page_current + 1) * page_size].to_dict('records'), map_iframe]
+
+    if filter is not None:
+        filtering_expressions = filter.split(' && ')
+        for filter_part in filtering_expressions:
+            col_name, operator, filter_value = split_filter_part(filter_part)
+
+            if operator in ('eq', 'ne', 'lt', 'le', 'gt', 'ge'):
+                # these operators match pandas series operator method names
+                dff = dff.loc[getattr(dff[col_name], operator)(filter_value)]
+            elif operator == 'contains':
+                dff = dff.loc[dff[col_name].str.contains(filter_value)]
+            elif operator == 'datestartswith':
+                # this is a simplification of the front-end filtering logic,
+                # only works with complete fields in standard format
+                dff = dff.loc[dff[col_name].str.startswith(filter_value)]
+
+    if len(sort_by):
+        dff = dff.sort_values(
+            sort_by[0]['column_id'],
+            ascending=sort_by[0]['direction'] == 'asc',
+            inplace=False
+        )
+    res = dff.iloc[page_current * page_size:(page_current + 1) * page_size].to_dict('records')
+
+    draw_score_markers(dff.to_dict('records'), lisbon_map, congestions_toggle)
+    map_iframe = embed_map(lisbon_map, prefix='emerging_patterns')
+    return [res, map_iframe]
+
+
+@app.callback(
+    [Output('patterns-modal', 'is_open'), Output('patterns-modal-body', 'children')],
+    [Input('patterns-datatable', 'active_cell'), Input('patterns-datatable', 'data')])
+def change_dataset(active_cell, data):
+    if not active_cell:
+        return [False, '']
+
+    row = data[active_cell['row']]
+    graph = TwoStepRegression.get_prediction_graph(row['x_names'], row['x'], row['y'], row['attribute'])
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=row['x_names'], y=row['y'], mode='markers', name='data'))
+    fig.add_trace(graph['fig'])
+    fig.update_layout(xaxis_title='Days', yaxis_title=row['attribute'])
+    return [True, get_graph(fig, '')]
+
+
+@app.callback(
+    [Output(prefix + 'charts', 'children'),
+     Output(prefix + 'attributes', 'options'),
+     Output(prefix + 'series_cache', 'value'),
+     Output(prefix + 'meteo_series_cache', 'value')],
+    [Input(prefix + 'button', 'n_clicks'), Input(prefix + 'attributes', 'value')],
     gui_utils.get_states(parameters, False, prefix))
-def run(n_clicks, *args):
+def run_discovery(n_clicks, attributes, *args):
+    attributes_opts = []
+    if not n_clicks:
+        return [[], attributes_opts, '', '']
+
+    trigger = dash.callback_context.triggered[0]
+    data_cached = False
+    if 'button' in trigger['prop_id']:
+        attributes = None
+    else:
+        data_cached = True
+
+    # Date range
+    start_date = pd.to_datetime(get_state_field('date', 'start_date', prefix))
+    end_date = pd.to_datetime(get_state_field('date', 'end_date', prefix))
+
+    # Days
+    calendar = get_state_field('calendario', prefix=prefix)
+    days = [gui_utils.get_calendar_days(calendar)]
+
+    # Granularity
     granularity = get_state_field('granularidade_em_minutos', prefix=prefix, type=int)
 
-    csv_file = get_state_field('csv_file_path', prefix=prefix, type=str)
-    if csv_file == '':
-        return []
+    pattern_discovery_method = get_state_field('method', prefix=prefix, type=str)
+    dataset = get_state_field('dataset', prefix=prefix, type=str)
 
-    state_params = dash.callback_context.states
-    # remove prefix and .value from
-    params = {}
-    for key in state_params:
-        params[key.replace(prefix, '').replace('.value', '')] = state_params[key]
-    time_series_orig = pd.read_csv(csv_file, parse_dates=True, index_col=[0])
-    time_series = time_series_orig
+    if not data_cached:
+        params_ok, res = get_dataset_time_series(dataset, start_date, end_date, days, granularity)
 
-    locations = pd.read_csv(csv_file.split('.')[0] + '-locations.csv', parse_dates=True, index_col=[0])
-    res = two_step_regression_handler(time_series, granularity, locations, csv_file)
-    res = html.Div(res, id="regressions_bigcontainer")
+        if not params_ok:
+            res = html.Span(res)
+            return [[res], attributes_opts, '', '']
 
-    return res
+        time_series, locations = res
+        time_series_orig = time_series
+    else:
+        # Read stuff from cached fields
+        time_series_orig = pd.read_json(get_state_field('series_cache', prefix=prefix, type=str), orient='split')
+
+        # Select only the columns of selected attributes
+        if len(attributes) != 0:
+            time_series = time_series_orig[attributes]
+        else:
+            time_series = time_series_orig
+
+    start_hour = get_state_field('start_hour', prefix=prefix, type=str)
+    end_hour = get_state_field('end_hour', prefix=prefix, type=str)
+
+    time_series = time_series.between_time(start_hour, end_hour)
+    filename = 'dataset_{}{}-{}{}-{}'.format(start_date, start_hour, end_date, end_hour, dataset)
+    file_path = '{}/{}'.format(DOWNLOADS_PATH, filename)
+    csv_file_path = '{}.csv'.format(file_path)
+    time_series_orig.between_time(start_hour, end_hour).to_csv('{}.csv'.format(file_path))
+
+    if pattern_discovery_method == 'two_step_regression':
+        res = two_step_regression_handler(time_series, granularity, locations, csv_file_path)
+        res = html.Div(res, id="regressions_bigcontainer")
+    else:
+        res = [html.Span('Abordagem nao implementada')]
+
+    time_series_attrs = list(time_series_orig.columns)
+    time_series_attrs = get_multidrop_options('{}', time_series_attrs)
+
+    attributes_opts += time_series_attrs
+
+    return [res, attributes_opts, time_series_orig.to_json(orient='split')]
 
 
 if __name__ == '__main__':
     app.layout = layout
-    app.run_server(debug=False, port=8050)
+    app.run_server(debug=False, port=8051)
